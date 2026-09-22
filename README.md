@@ -25,6 +25,22 @@ cargo run -- plan examples/pod.yaml --runtime-class kata-qemu-coco \
 
 It is advisory by design: TeeLens does not replace Kubernetes scheduling.
 
+## Dynamic Resource Allocation (DRA)
+
+`dra` turns the accelerator requests in a Pod into a Kubernetes
+`resource.k8s.io/v1` `ResourceClaimTemplate`:
+
+```bash
+cargo run -- dra examples/pod.yaml \
+  --device-class nvidia.com/gpu=production-gpu
+```
+
+The DeviceClass mapping is required explicitly: DeviceClasses and their driver
+selectors are controlled by each cluster. Review the output and connect the
+template to the Pod's `resourceClaims` before applying it. TeeLens does not
+create DeviceClasses, infer driver selectors, use `adminAccess`, or apply
+objects to a cluster.
+
 ## kubectl plugin
 
 Install the read-only plugin with `cargo install --path . --bin kubectl-teelens`.

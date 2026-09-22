@@ -52,6 +52,21 @@ enum Command {
         #[arg(long)]
         kata_config: PathBuf,
     },
+    /// Compile accelerator requests into a Kubernetes DRA ResourceClaimTemplate.
+    Dra {
+        /// Kubernetes Pod manifest (YAML or JSON).
+        pod: PathBuf,
+        /// Resource-to-DeviceClass mapping, for example nvidia.com/gpu=production-gpu.
+        #[arg(
+            long = "device-class",
+            value_name = "RESOURCE=DEVICE_CLASS",
+            required = true
+        )]
+        device_classes: Vec<String>,
+        /// Name for the generated ResourceClaimTemplate. Defaults to <pod-name>-devices.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -69,6 +84,8 @@ enum AppError {
     },
     #[error("cannot parse {path}: {details}")]
     Parse { path: String, details: String },
+    #[error("invalid input: {0}")]
+    Invalid(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +221,53 @@ struct PlacementManifest {
     migration: &'static str,
 }
 
+/// The stable Kubernetes DRA API object. DeviceClasses are intentionally
+/// supplied by the caller because they are cluster and driver specific.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceClaimTemplate {
+    api_version: &'static str,
+    kind: &'static str,
+    metadata: DraMetadata,
+    spec: ResourceClaimTemplateSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct DraMetadata {
+    name: String,
+    annotations: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceClaimTemplateSpec {
+    spec: DeviceClaim,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceClaim {
+    devices: DeviceClaimDevices,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceClaimDevices {
+    requests: Vec<DeviceRequest>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceRequest {
+    name: String,
+    exactly: ExactDeviceRequest,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExactDeviceRequest {
+    device_class_name: String,
+    allocation_mode: &'static str,
+    count: u32,
+}
+
 fn read(path: &PathBuf) -> Result<String, AppError> {
     fs::read_to_string(path).map_err(|source| AppError::Read {
         path: path.display().to_string(),
@@ -324,6 +388,103 @@ fn requested_accelerators(pod: &Pod) -> BTreeMap<String, u32> {
         }
     }
     requested
+}
+
+fn dns_label(input: &str) -> String {
+    let mut label: String = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    label = label.trim_matches('-').to_owned();
+    if label.is_empty() {
+        "device".into()
+    } else {
+        label.chars().take(63).collect()
+    }
+}
+
+fn parse_device_classes(entries: &[String]) -> Result<BTreeMap<String, String>, AppError> {
+    let mut classes = BTreeMap::new();
+    for entry in entries {
+        let (resource, class) = entry.split_once('=').ok_or_else(|| {
+            AppError::Invalid(format!(
+                "--device-class must use RESOURCE=DEVICE_CLASS, got {entry:?}"
+            ))
+        })?;
+        if resource.is_empty() || class.is_empty() {
+            return Err(AppError::Invalid(format!(
+                "--device-class must use non-empty RESOURCE=DEVICE_CLASS, got {entry:?}"
+            )));
+        }
+        if classes
+            .insert(resource.to_owned(), class.to_owned())
+            .is_some()
+        {
+            return Err(AppError::Invalid(format!(
+                "duplicate DeviceClass mapping for resource {resource:?}"
+            )));
+        }
+    }
+    Ok(classes)
+}
+
+fn resource_claim_template(
+    pod: &Pod,
+    device_classes: BTreeMap<String, String>,
+    name: Option<String>,
+) -> Result<ResourceClaimTemplate, AppError> {
+    let requested = requested_accelerators(pod);
+    if requested.is_empty() {
+        return Err(AppError::Invalid(
+            "the Pod has no accelerator resource requests to compile into DRA".into(),
+        ));
+    }
+    let mut requests = Vec::new();
+    for (resource, count) in requested {
+        let device_class_name = device_classes.get(&resource).ok_or_else(|| {
+            AppError::Invalid(format!(
+                "missing --device-class mapping for requested resource {resource:?}"
+            ))
+        })?;
+        requests.push(DeviceRequest {
+            name: dns_label(&resource),
+            exactly: ExactDeviceRequest {
+                device_class_name: device_class_name.clone(),
+                allocation_mode: "ExactCount",
+                count,
+            },
+        });
+    }
+    let pod_name = pod
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.name.as_deref())
+        .unwrap_or("workload");
+    let mut annotations = BTreeMap::new();
+    annotations.insert("teelens.io/compiler".into(), "dra/v1".into());
+    annotations.insert(
+        "teelens.io/notice".into(),
+        "DeviceClasses are cluster-managed; verify driver selectors before applying.".into(),
+    );
+    Ok(ResourceClaimTemplate {
+        api_version: "resource.k8s.io/v1",
+        kind: "ResourceClaimTemplate",
+        metadata: DraMetadata {
+            name: name.unwrap_or_else(|| format!("{}-devices", dns_label(pod_name))),
+            annotations,
+        },
+        spec: ResourceClaimTemplateSpec {
+            spec: DeviceClaim {
+                devices: DeviceClaimDevices { requests },
+            },
+        },
+    })
 }
 
 fn plan(
@@ -523,6 +684,22 @@ fn main() -> Result<(), AppError> {
                 serde_json::to_string_pretty(&manifest).expect("serializable placement manifest")
             );
         }
+        Command::Dra {
+            pod,
+            device_classes,
+            name,
+        } => {
+            let pod: Pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let template =
+                resource_claim_template(&pod, parse_device_classes(&device_classes)?, name)?;
+            println!(
+                "{}",
+                serde_yaml::to_string(&template).expect("serializable DRA template")
+            );
+        }
     }
     Ok(())
 }
@@ -574,5 +751,42 @@ mod tests {
         };
         let report = plan(pod, "wasmtime", inventory, config());
         assert_eq!(report.eligible_nodes, vec!["wasm"]);
+    }
+
+    #[test]
+    fn dra_compiles_accelerator_request_with_explicit_device_class() {
+        let pod: Pod = serde_yaml::from_str(
+            "metadata:\n  name: protected\nspec:\n  containers:\n  - resources:\n      requests:\n        nvidia.com/gpu: '2'\n",
+        )
+        .unwrap();
+        let template = resource_claim_template(
+            &pod,
+            BTreeMap::from([("nvidia.com/gpu".into(), "production-gpu".into())]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(template.api_version, "resource.k8s.io/v1");
+        assert_eq!(template.metadata.name, "protected-devices");
+        assert_eq!(
+            template.spec.spec.devices.requests[0].name,
+            "nvidia-com-gpu"
+        );
+        assert_eq!(template.spec.spec.devices.requests[0].exactly.count, 2);
+        assert_eq!(
+            template.spec.spec.devices.requests[0]
+                .exactly
+                .device_class_name,
+            "production-gpu"
+        );
+    }
+
+    #[test]
+    fn dra_rejects_missing_device_class_mapping() {
+        let pod: Pod = serde_yaml::from_str(
+            "spec:\n  containers:\n  - resources:\n      requests:\n        nvidia.com/gpu: '1'\n",
+        )
+        .unwrap();
+        let error = resource_claim_template(&pod, BTreeMap::new(), None).unwrap_err();
+        assert!(error.to_string().contains("missing --device-class mapping"));
     }
 }
