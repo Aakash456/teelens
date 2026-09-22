@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf, process::Command as ProcessC
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
@@ -115,6 +116,25 @@ enum Command {
     Exposure {
         #[command(subcommand)]
         command: ExposureCommand,
+    },
+    /// Create or verify a deterministic trust-input lockfile.
+    Witness {
+        #[command(subcommand)]
+        command: WitnessCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum WitnessCommand {
+    Compile {
+        #[arg(long, required = true)]
+        input: Vec<PathBuf>,
+    },
+    Verify {
+        #[arg(long)]
+        witness: PathBuf,
+        #[arg(long, required = true)]
+        input: Vec<PathBuf>,
     },
 }
 
@@ -291,6 +311,13 @@ struct ExposureBudget {
     migration: &'static str,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Witness {
+    api_version: String,
+    inputs: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Report {
@@ -414,6 +441,27 @@ fn read(path: &PathBuf) -> Result<String, AppError> {
     fs::read_to_string(path).map_err(|source| AppError::Read {
         path: path.display().to_string(),
         source,
+    })
+}
+
+fn witness(inputs: &[PathBuf]) -> Result<Witness, AppError> {
+    let mut hashes = BTreeMap::new();
+    for path in inputs {
+        let bytes = fs::read(path).map_err(|source| AppError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        hashes.insert(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("input")
+                .into(),
+            format!("sha256:{:x}", Sha256::digest(bytes)),
+        );
+    }
+    Ok(Witness {
+        api_version: "teelens.io/witness/v1".into(),
+        inputs: hashes,
     })
 }
 
@@ -1415,6 +1463,36 @@ pub fn run() -> Result<(), AppError> {
                 ))
                 .expect("serializable exposure report")
             );
+        }
+        Command::Witness {
+            command: WitnessCommand::Compile { input },
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&witness(&input)?).expect("serializable witness")
+            );
+        }
+        Command::Witness {
+            command:
+                WitnessCommand::Verify {
+                    witness: path,
+                    input,
+                },
+        } => {
+            let expected: Witness =
+                serde_json::from_str(&read(&path)?).map_err(|e| AppError::Parse {
+                    path: path.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let actual = witness(&input)?;
+            let changed: Vec<_> = expected
+                .inputs
+                .iter()
+                .filter_map(|(name, hash)| {
+                    (actual.inputs.get(name) != Some(hash)).then(|| name.clone())
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"apiVersion":"teelens.io/witness-report/v1", "verified": changed.is_empty(), "changedInputs": changed})).expect("serializable witness report"));
         }
     }
     Ok(())
