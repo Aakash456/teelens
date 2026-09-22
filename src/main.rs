@@ -67,6 +67,24 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Emit a DRA ResourceClaimTemplate and a Pod patched to consume it.
+    DraBundle {
+        /// Kubernetes Pod manifest (YAML or JSON).
+        pod: PathBuf,
+        /// Resource-to-DeviceClass mapping, for example nvidia.com/gpu=production-gpu.
+        #[arg(
+            long = "device-class",
+            value_name = "RESOURCE=DEVICE_CLASS",
+            required = true
+        )]
+        device_classes: Vec<String>,
+        /// Container granted access to the generated claim. Repeat for each requesting container.
+        #[arg(long = "container", required = true)]
+        containers: Vec<String>,
+        /// Name for the generated ResourceClaimTemplate. Defaults to <pod-name>-devices.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -112,6 +130,7 @@ struct PodSpec {
 
 #[derive(Debug, Deserialize)]
 struct Container {
+    name: Option<String>,
     resources: Option<Resources>,
 }
 
@@ -487,6 +506,154 @@ fn resource_claim_template(
     })
 }
 
+fn accelerator_requesting_containers(pod: &Pod) -> Vec<String> {
+    pod.spec
+        .as_ref()
+        .into_iter()
+        .flat_map(|spec| &spec.containers)
+        .filter(|container| {
+            container
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.requests.as_ref())
+                .is_some_and(|requests| {
+                    requests.keys().any(|resource| {
+                        resource.contains("gpu") || resource.contains("accelerator")
+                    })
+                })
+        })
+        .filter_map(|container| container.name.clone())
+        .collect()
+}
+
+fn mapping(value: &mut serde_yaml::Value) -> Result<&mut serde_yaml::Mapping, AppError> {
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| AppError::Invalid("Pod manifest must be a YAML object".into()))
+}
+
+fn value_key(name: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(name.into())
+}
+
+fn patch_pod_for_dra(
+    mut pod: serde_yaml::Value,
+    template_name: &str,
+    requested_resources: &BTreeMap<String, u32>,
+    containers: &[String],
+) -> Result<serde_yaml::Value, AppError> {
+    let selected: std::collections::BTreeSet<_> = containers.iter().cloned().collect();
+    if selected.len() != containers.len() {
+        return Err(AppError::Invalid(
+            "--container was repeated for the same container".into(),
+        ));
+    }
+    let spec = mapping(&mut pod)?
+        .get_mut(value_key("spec"))
+        .ok_or_else(|| AppError::Invalid("Pod manifest is missing spec".into()))?;
+    let spec = mapping(spec)?;
+    if spec.contains_key(value_key("resourceClaims")) {
+        return Err(AppError::Invalid(
+            "Pod already has spec.resourceClaims; merge it manually to avoid overwriting claims"
+                .into(),
+        ));
+    }
+    let claim_name = "teelens-devices";
+    let mut claim = serde_yaml::Mapping::new();
+    claim.insert(value_key("name"), value_key(claim_name));
+    claim.insert(
+        value_key("resourceClaimTemplateName"),
+        value_key(template_name),
+    );
+    spec.insert(
+        value_key("resourceClaims"),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(claim)]),
+    );
+    let containers_value = spec
+        .get_mut(value_key("containers"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| AppError::Invalid("Pod spec must contain a containers list".into()))?;
+    let mut found = std::collections::BTreeSet::new();
+    for container in containers_value {
+        let container = mapping(container)?;
+        let name = container
+            .get(value_key("name"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !selected.contains(&name) {
+            continue;
+        }
+        found.insert(name.clone());
+        let resources = container
+            .entry(value_key("resources"))
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let resources = mapping(resources)?;
+        if resources.contains_key(value_key("claims")) {
+            return Err(AppError::Invalid(format!(
+                "container {name:?} already has resources.claims; merge it manually"
+            )));
+        }
+        let mut claim_access = serde_yaml::Mapping::new();
+        claim_access.insert(value_key("name"), value_key(claim_name));
+        resources.insert(
+            value_key("claims"),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(claim_access)]),
+        );
+        for field in ["requests", "limits"] {
+            if let Some(values) = resources
+                .get_mut(value_key(field))
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                for resource in requested_resources.keys() {
+                    values.remove(value_key(resource));
+                }
+            }
+        }
+    }
+    if found != selected {
+        let missing: Vec<_> = selected.difference(&found).cloned().collect();
+        return Err(AppError::Invalid(format!(
+            "--container names not found in Pod: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(pod)
+}
+
+fn dra_bundle(
+    pod: &Pod,
+    pod_yaml: serde_yaml::Value,
+    device_classes: BTreeMap<String, String>,
+    name: Option<String>,
+    containers: &[String],
+) -> Result<(ResourceClaimTemplate, serde_yaml::Value), AppError> {
+    let requesters: std::collections::BTreeSet<_> =
+        accelerator_requesting_containers(pod).into_iter().collect();
+    let selected: std::collections::BTreeSet<_> = containers.iter().cloned().collect();
+    if requesters.is_empty() {
+        return Err(AppError::Invalid(
+            "DRA bundle requires named containers with accelerator requests".into(),
+        ));
+    }
+    if !requesters.is_subset(&selected) {
+        let omitted: Vec<_> = requesters.difference(&selected).cloned().collect();
+        return Err(AppError::Invalid(format!(
+            "--container must include every accelerator-requesting container: {}",
+            omitted.join(", ")
+        )));
+    }
+    let requested_resources = requested_accelerators(pod);
+    let template = resource_claim_template(pod, device_classes, name)?;
+    let patched = patch_pod_for_dra(
+        pod_yaml,
+        &template.metadata.name,
+        &requested_resources,
+        containers,
+    )?;
+    Ok((template, patched))
+}
+
 fn plan(
     pod: Pod,
     runtime_class: &str,
@@ -700,6 +867,34 @@ fn main() -> Result<(), AppError> {
                 serde_yaml::to_string(&template).expect("serializable DRA template")
             );
         }
+        Command::DraBundle {
+            pod,
+            device_classes,
+            containers,
+            name,
+        } => {
+            let raw_pod = read(&pod)?;
+            let typed_pod: Pod = serde_yaml::from_str(&raw_pod).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let yaml_pod = serde_yaml::from_str(&raw_pod).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let (template, patched_pod) = dra_bundle(
+                &typed_pod,
+                yaml_pod,
+                parse_device_classes(&device_classes)?,
+                name,
+                &containers,
+            )?;
+            println!(
+                "---\n{}---\n{}",
+                serde_yaml::to_string(&template).expect("serializable DRA template"),
+                serde_yaml::to_string(&patched_pod).expect("serializable patched Pod")
+            );
+        }
     }
     Ok(())
 }
@@ -788,5 +983,26 @@ mod tests {
         .unwrap();
         let error = resource_claim_template(&pod, BTreeMap::new(), None).unwrap_err();
         assert!(error.to_string().contains("missing --device-class mapping"));
+    }
+
+    #[test]
+    fn dra_bundle_adds_claim_access_and_removes_extended_resource() {
+        let raw = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: protected\nspec:\n  containers:\n  - name: app\n    image: example.invalid/app\n    resources:\n      requests:\n        nvidia.com/gpu: '1'\n        cpu: '1'\n";
+        let pod: Pod = serde_yaml::from_str(raw).unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(raw).unwrap();
+        let (template, patched) = dra_bundle(
+            &pod,
+            yaml,
+            BTreeMap::from([("nvidia.com/gpu".into(), "production-gpu".into())]),
+            None,
+            &["app".into()],
+        )
+        .unwrap();
+        assert_eq!(template.metadata.name, "protected-devices");
+        let text = serde_yaml::to_string(&patched).unwrap();
+        assert!(text.contains("resourceClaimTemplateName: protected-devices"));
+        assert!(text.contains("claims:"));
+        assert!(text.contains("cpu: '1'"));
+        assert!(!text.contains("nvidia.com/gpu"));
     }
 }

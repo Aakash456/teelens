@@ -41,6 +41,18 @@ template to the Pod's `resourceClaims` before applying it. TeeLens does not
 create DeviceClasses, infer driver selectors, use `adminAccess`, or apply
 objects to a cluster.
 
+For a reviewable two-document manifest (claim template and patched Pod), use:
+
+```bash
+cargo run -- dra-bundle examples/pod.yaml \
+  --device-class nvidia.com/gpu=production-gpu \
+  --container app
+```
+
+Every container requesting an accelerator must be listed explicitly. The
+patched Pod removes the converted extended-resource request and grants only
+those named containers access to the generated claim.
+
 ## kubectl plugin
 
 Install the read-only plugin with `cargo install --path . --bin kubectl-teelens`.
