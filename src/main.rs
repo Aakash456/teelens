@@ -111,6 +111,27 @@ enum Command {
         #[arg(long)]
         kata_config: PathBuf,
     },
+    /// Compile a trust-exposure graph for a heterogeneous workload.
+    Exposure {
+        #[command(subcommand)]
+        command: ExposureCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ExposureCommand {
+    /// Compile a trust graph and exposure budget without contacting a cluster.
+    Compile {
+        pod: PathBuf,
+        #[arg(long)]
+        runtime_class: String,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        node_inventory: PathBuf,
+        #[arg(long)]
+        kata_config: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -239,6 +260,35 @@ struct MigrationReport {
     compatible: bool,
     blockers: Vec<String>,
     assumptions: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExposureReport {
+    api_version: &'static str,
+    eligible_nodes: Vec<String>,
+    graph: Vec<TrustStage>,
+    budget: ExposureBudget,
+    findings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustStage {
+    name: &'static str,
+    execution_target: String,
+    required_evidence: Vec<&'static str>,
+    host_trust: &'static str,
+    device_trust: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExposureBudget {
+    allowed_host_trust: bool,
+    allowed_device_trust: &'static str,
+    required_tee: Vec<Tee>,
+    migration: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1039,6 +1089,68 @@ fn plan(
     }
 }
 
+fn exposure_compile(
+    pod: Pod,
+    runtime_class: &str,
+    policy: TrustPolicy,
+    inventory: NodeInventory,
+    config: toml::Value,
+) -> ExposureReport {
+    let plan = plan(pod, runtime_class, inventory, config);
+    let accelerator_bound = !plan.required_accelerators.is_empty();
+    let confidential = runtime_class.contains("coco");
+    let mut findings = Vec::new();
+    if plan.eligible_nodes.is_empty() {
+        findings.push("no node satisfies the current placement and trust constraints".into());
+    }
+    if accelerator_bound {
+        findings.push(
+            "accelerator access expands the trusted computing base; validate driver, DMA, and DRA DeviceClass policy"
+                .into(),
+        );
+    }
+    if confidential && policy.allowed_tee.is_empty() {
+        findings.push("confidential runtime has no explicit allowedTee policy".into());
+    }
+    let required_evidence = if confidential {
+        vec!["host-capability-inventory", "attestation-policy"]
+    } else {
+        vec!["host-capability-inventory"]
+    };
+    let mut graph = vec![TrustStage {
+        name: "workload-runtime",
+        execution_target: plan.execution_target.clone(),
+        required_evidence,
+        host_trust: if confidential { "denied" } else { "required" },
+        device_trust: if accelerator_bound { "bounded" } else { "none" },
+    }];
+    if accelerator_bound {
+        graph.push(TrustStage {
+            name: "accelerator-path",
+            execution_target: "dra:device-class".into(),
+            required_evidence: vec!["DRA DeviceClass", "driver-policy", "topology-review"],
+            host_trust: if confidential { "denied" } else { "required" },
+            device_trust: "driver-and-dma-boundary",
+        });
+    }
+    ExposureReport {
+        api_version: "teelens.io/trust-exposure/v1",
+        eligible_nodes: plan.eligible_nodes,
+        graph,
+        budget: ExposureBudget {
+            allowed_host_trust: !confidential,
+            allowed_device_trust: if accelerator_bound {
+                "driver-and-dma-boundary"
+            } else {
+                "none"
+            },
+            required_tee: policy.allowed_tee,
+            migration: "deny-until-equivalent-trust-envelope",
+        },
+        findings,
+    }
+}
+
 pub fn run() -> Result<(), AppError> {
     let cli = Cli::parse();
     match cli.command {
@@ -1262,6 +1374,46 @@ pub fn run() -> Result<(), AppError> {
                     config
                 ))
                 .expect("serializable migration report")
+            );
+        }
+        Command::Exposure {
+            command:
+                ExposureCommand::Compile {
+                    pod,
+                    runtime_class,
+                    policy,
+                    node_inventory,
+                    kata_config,
+                },
+        } => {
+            let pod: Pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let policy: TrustPolicy =
+                serde_yaml::from_str(&read(&policy)?).map_err(|e| AppError::Parse {
+                    path: policy.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let inventory: NodeInventory =
+                serde_json::from_str(&read(&node_inventory)?).map_err(|e| AppError::Parse {
+                    path: node_inventory.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let config = toml::from_str(&read(&kata_config)?).map_err(|e| AppError::Parse {
+                path: kata_config.display().to_string(),
+                details: e.to_string(),
+            })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&exposure_compile(
+                    pod,
+                    &runtime_class,
+                    policy,
+                    inventory,
+                    config,
+                ))
+                .expect("serializable exposure report")
             );
         }
     }

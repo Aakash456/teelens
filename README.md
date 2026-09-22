@@ -87,6 +87,22 @@ cargo run -- migrate-check --source examples/node-capabilities.json \
   --runtime-class kata-qemu-coco --kata-config examples/configuration-qemu.toml
 ```
 
+## Trust Exposure Compiler
+
+Compile a reviewable trust graph and budget before deployment:
+
+```bash
+cargo run -- exposure compile examples/pod.yaml \
+  --runtime-class kata-qemu-coco \
+  --policy examples/trust-policy.yaml \
+  --node-inventory examples/node-inventory.json \
+  --kata-config examples/configuration-qemu.toml
+```
+
+The output distinguishes runtime trust from accelerator driver/DMA trust and
+sets migration to deny until an equivalent trust envelope is verified. It is a
+policy-analysis artifact, not an attestation result or scheduler decision.
+
 ## kubectl plugin
 
 Install the read-only plugin with `cargo install --path . --bin kubectl-teelens`.
