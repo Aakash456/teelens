@@ -117,7 +117,7 @@ enum Output {
 }
 
 #[derive(Debug, Error)]
-enum AppError {
+pub enum AppError {
     #[error("cannot read {path}: {source}")]
     Read {
         path: String,
@@ -359,7 +359,9 @@ fn selected_hypervisor(config: &toml::Value) -> Option<String> {
 fn collect_local(name: Option<String>) -> NodeCapabilities {
     let has_path = |path: &str| std::path::Path::new(path).exists();
     let mut tee = Vec::new();
-    if has_path("/dev/sev") || has_path("/sys/module/ccp") {
+    // CCP is a prerequisite driver on many AMD systems, but its presence does
+    // not prove that this host exposes the SEV guest interface or SEV-SNP.
+    if has_path("/dev/sev") {
         tee.push(Tee::SevSnp);
     }
     if has_path("/sys/firmware/tdx_guest") || has_path("/dev/tdx-guest") {
@@ -762,13 +764,19 @@ fn patch_pod_for_dra(
             serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(claim_access)]),
         );
         for field in ["requests", "limits"] {
-            if let Some(values) = resources
+            let empty = if let Some(values) = resources
                 .get_mut(value_key(field))
                 .and_then(serde_yaml::Value::as_mapping_mut)
             {
                 for resource in requested_resources.keys() {
                     values.remove(value_key(resource));
                 }
+                values.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                resources.remove(value_key(field));
             }
         }
     }
@@ -895,7 +903,7 @@ fn plan(
     }
 }
 
-fn main() -> Result<(), AppError> {
+pub fn run() -> Result<(), AppError> {
     let cli = Cli::parse();
     match cli.command {
         Command::Check {

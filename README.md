@@ -63,8 +63,10 @@ cargo run -- collect --name node-a > node-capabilities.json
 ```
 
 The collector deliberately does not collect attestation evidence, private
-keys, measurements, GPU inventory, or infer installed VMM/WASM runtimes. Add
-those through a reviewed node agent or CI inventory source.
+keys, measurements, GPU inventory, or infer installed VMM/WASM runtimes. It
+reports SEV-SNP only when the host exposes `/dev/sev`; an AMD CCP driver alone
+is not treated as evidence. Add the remaining facts through a reviewed node
+agent or CI inventory source.
 
 Validate a versioned trust policy and make a conservative migration preflight:
 
