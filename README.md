@@ -56,17 +56,18 @@ those named containers access to the generated claim.
 ## v0.2 trust inputs
 
 Collect a non-secret local capability document (KVM, detected TEE indicators,
-architecture, and NUMA nodes):
+architecture, kernel/CPU facts, NUMA, IOMMU, PCI/GPU/NIC enumeration, and
+installed QEMU, Cloud Hypervisor, Wasmtime, and WasmEdge versions):
 
 ```bash
 cargo run -- collect --name node-a > node-capabilities.json
 ```
 
 The collector deliberately does not collect attestation evidence, private
-keys, measurements, GPU inventory, or infer installed VMM/WASM runtimes. It
-reports SEV-SNP only when the host exposes `/dev/sev`; an AMD CCP driver alone
-is not treated as evidence. Add the remaining facts through a reviewed node
-agent or CI inventory source.
+keys, or measurements. It reports SEV-SNP only when the host exposes
+`/dev/sev`; an AMD CCP driver alone is not treated as evidence. Hardware
+inventory is descriptive—not an attestation result—and must be verified by a
+policy/attestation service before confidential deployment.
 
 Validate a versioned trust policy and make a conservative migration preflight:
 

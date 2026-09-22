@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf, process::Command as ProcessCommand};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,22 @@ struct NodeCapabilities {
     wasm_runtimes: Vec<String>,
     #[serde(default)]
     numa_nodes: Vec<u32>,
+    #[serde(default)]
+    kernel: String,
+    #[serde(default)]
+    cpu_model: String,
+    #[serde(default)]
+    cpu_features: Vec<String>,
+    #[serde(default)]
+    iommu: bool,
+    #[serde(default)]
+    pci_devices: u32,
+    #[serde(default)]
+    gpu_pci_devices: Vec<String>,
+    #[serde(default)]
+    network_interfaces: Vec<String>,
+    #[serde(default)]
+    software_versions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +396,77 @@ fn collect_local(name: Option<String>) -> NodeCapabilities {
                 .and_then(|number| number.parse().ok())
         })
         .collect();
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let cpu_value = |key: &str| {
+        cpuinfo.lines().find_map(|line| {
+            line.split_once(':')
+                .and_then(|(name, value)| (name.trim() == key).then(|| value.trim().to_owned()))
+        })
+    };
+    let cpu_features = cpu_value("flags")
+        .or_else(|| cpu_value("Features"))
+        .map(|flags| {
+            ["vmx", "svm", "aes", "avx", "avx2", "avx512f"]
+                .into_iter()
+                .filter(|flag| flags.split_whitespace().any(|value| value == *flag))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let pci_entries: Vec<_> = fs::read_dir("/sys/bus/pci/devices")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .collect();
+    let gpu_pci_devices = pci_entries
+        .iter()
+        .filter_map(|entry| {
+            let class = fs::read_to_string(entry.path().join("class")).ok()?;
+            class
+                .trim_start()
+                .starts_with("0x03")
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    let network_interfaces = fs::read_dir("/sys/class/net")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|interface| interface != "lo")
+        .collect();
+    let command_version = |binary: &str| {
+        ProcessCommand::new(binary)
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| output.lines().next().map(str::to_owned))
+    };
+    let mut software_versions = BTreeMap::new();
+    for (binary, label) in [
+        ("qemu-system-x86_64", "qemu"),
+        ("cloud-hypervisor", "cloud-hypervisor"),
+        ("wasmtime", "wasmtime"),
+        ("wasmedge", "wasmedge"),
+    ] {
+        if let Some(version) = command_version(binary) {
+            software_versions.insert(label.into(), version);
+        }
+    }
+    let hypervisors = ["qemu", "cloud-hypervisor"]
+        .into_iter()
+        .filter(|name| software_versions.contains_key(*name))
+        .map(str::to_owned)
+        .collect();
+    let wasm_runtimes = ["wasmtime", "wasmedge"]
+        .into_iter()
+        .filter(|name| software_versions.contains_key(*name))
+        .map(str::to_owned)
+        .collect();
     NodeCapabilities {
         name: name
             .or_else(|| std::env::var("HOSTNAME").ok())
@@ -388,10 +475,25 @@ fn collect_local(name: Option<String>) -> NodeCapabilities {
         architecture: std::env::consts::ARCH.into(),
         kvm: has_path("/dev/kvm"),
         tee,
-        hypervisors: Vec::new(),
+        hypervisors,
         accelerators: BTreeMap::new(),
-        wasm_runtimes: Vec::new(),
+        wasm_runtimes,
         numa_nodes,
+        kernel: ProcessCommand::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|output| output.trim().to_owned())
+            .unwrap_or_else(|| std::env::consts::OS.into()),
+        cpu_model: cpu_value("model name").unwrap_or_default(),
+        cpu_features,
+        iommu: fs::read_dir("/sys/kernel/iommu_groups").is_ok(),
+        pci_devices: pci_entries.len() as u32,
+        gpu_pci_devices,
+        network_interfaces,
+        software_versions,
     }
 }
 
@@ -1145,6 +1247,14 @@ mod tests {
             accelerators: BTreeMap::from([("nvidia.com/gpu".into(), gpus)]),
             wasm_runtimes: vec!["wasmtime".into()],
             numa_nodes: vec![0],
+            kernel: "test".into(),
+            cpu_model: "test".into(),
+            cpu_features: vec!["svm".into()],
+            iommu: true,
+            pci_devices: 0,
+            gpu_pci_devices: Vec::new(),
+            network_interfaces: Vec::new(),
+            software_versions: BTreeMap::new(),
         }
     }
 
