@@ -526,3 +526,53 @@ fn main() -> Result<(), AppError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> toml::Value {
+        toml::from_str("[hypervisor.qemu]\npath = 'qemu'").unwrap()
+    }
+
+    fn node(name: &str, tee: Vec<Tee>, gpus: u32) -> NodeCapabilities {
+        NodeCapabilities {
+            name: name.into(),
+            api_version: "teelens.io/node-capabilities/v1".into(),
+            architecture: "x86_64".into(),
+            kvm: true,
+            tee,
+            hypervisors: vec!["qemu".into()],
+            accelerators: BTreeMap::from([("nvidia.com/gpu".into(), gpus)]),
+            wasm_runtimes: vec!["wasmtime".into()],
+        }
+    }
+
+    #[test]
+    fn confidential_gpu_workload_rejects_untrusted_node() {
+        let pod: Pod = serde_yaml::from_str("metadata:\n  name: protected\nspec:\n  containers:\n  - resources:\n      requests:\n        nvidia.com/gpu: '1'\n").unwrap();
+        let inventory = NodeInventory {
+            api_version: "teelens.io/node-inventory/v1".into(),
+            nodes: vec![node("snp", vec![Tee::SevSnp], 1), node("plain", vec![], 1)],
+        };
+        let report = plan(pod, "kata-qemu-coco", inventory, config());
+        assert_eq!(report.eligible_nodes, vec!["snp"]);
+        assert_eq!(report.rejected_nodes[0].name, "plain");
+    }
+
+    #[test]
+    fn wasm_workload_does_not_require_kvm() {
+        let pod: Pod = serde_yaml::from_str(
+            "metadata:\n  annotations:\n    teelens.io/wasm-runtime: wasmtime\n",
+        )
+        .unwrap();
+        let mut wasm = node("wasm", vec![], 0);
+        wasm.kvm = false;
+        let inventory = NodeInventory {
+            api_version: "teelens.io/node-inventory/v1".into(),
+            nodes: vec![wasm],
+        };
+        let report = plan(pod, "wasmtime", inventory, config());
+        assert_eq!(report.eligible_nodes, vec!["wasm"]);
+    }
+}
