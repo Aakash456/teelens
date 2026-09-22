@@ -449,10 +449,15 @@ fn collect_local(name: Option<String>) -> NodeCapabilities {
     let mut software_versions = BTreeMap::new();
     for (binary, label) in [
         ("qemu-system-x86_64", "qemu"),
+        // Oracle Linux packages the system emulator as qemu-kvm.
+        ("qemu-kvm", "qemu"),
         ("cloud-hypervisor", "cloud-hypervisor"),
         ("wasmtime", "wasmtime"),
         ("wasmedge", "wasmedge"),
     ] {
+        if software_versions.contains_key(label) {
+            continue;
+        }
         if let Some(version) = command_version(binary) {
             software_versions.insert(label.into(), version);
         }
