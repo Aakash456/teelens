@@ -126,6 +126,9 @@ enum Command {
     Admit {
         #[arg(long, required = true)]
         input: Vec<PathBuf>,
+        /// Optional Pod manifest to annotate with the generated witness digest.
+        #[arg(long)]
+        pod: Option<PathBuf>,
     },
 }
 
@@ -330,6 +333,8 @@ struct AdmissionPack {
     decision: &'static str,
     witness: Witness,
     witness_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,6 +482,22 @@ fn witness(inputs: &[PathBuf]) -> Result<Witness, AppError> {
         api_version: "teelens.io/witness/v1".into(),
         inputs: hashes,
     })
+}
+
+fn annotate_witness(
+    mut pod: serde_yaml::Value,
+    digest: &str,
+) -> Result<serde_yaml::Value, AppError> {
+    let root = mapping(&mut pod)?;
+    let metadata = root
+        .entry(value_key("metadata"))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let metadata = mapping(metadata)?;
+    let annotations = metadata
+        .entry(value_key("annotations"))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    mapping(annotations)?.insert(value_key("teelens.io/witness-digest"), value_key(digest));
+    Ok(pod)
 }
 
 fn selected_hypervisor(config: &toml::Value) -> Option<String> {
@@ -1486,17 +1507,28 @@ pub fn run() -> Result<(), AppError> {
                 serde_json::to_string_pretty(&witness(&input)?).expect("serializable witness")
             );
         }
-        Command::Admit { input } => {
+        Command::Admit { input, pod } => {
             let witness = witness(&input)?;
             let digest = format!(
                 "sha256:{:x}",
                 Sha256::digest(serde_json::to_vec(&witness).expect("serializable witness"))
             );
+            let pod = pod
+                .map(|path| {
+                    let raw = read(&path)?;
+                    let value = serde_yaml::from_str(&raw).map_err(|e| AppError::Parse {
+                        path: path.display().to_string(),
+                        details: e.to_string(),
+                    })?;
+                    annotate_witness(value, &digest)
+                })
+                .transpose()?;
             let pack = AdmissionPack {
                 api_version: "teelens.io/admission-pack/v1",
                 decision: "needs-attestation",
                 witness,
                 witness_digest: digest,
+                pod,
             };
             println!(
                 "{}",
