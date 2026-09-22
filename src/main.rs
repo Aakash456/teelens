@@ -122,6 +122,11 @@ enum Command {
         #[command(subcommand)]
         command: WitnessCommand,
     },
+    /// Compile a unified admission pack from existing TeeLens artifacts.
+    Admit {
+        #[arg(long, required = true)]
+        input: Vec<PathBuf>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -316,6 +321,15 @@ struct ExposureBudget {
 struct Witness {
     api_version: String,
     inputs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmissionPack {
+    api_version: &'static str,
+    decision: &'static str,
+    witness: Witness,
+    witness_digest: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1470,6 +1484,23 @@ pub fn run() -> Result<(), AppError> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&witness(&input)?).expect("serializable witness")
+            );
+        }
+        Command::Admit { input } => {
+            let witness = witness(&input)?;
+            let digest = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&witness).expect("serializable witness"))
+            );
+            let pack = AdmissionPack {
+                api_version: "teelens.io/admission-pack/v1",
+                decision: "needs-attestation",
+                witness,
+                witness_digest: digest,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pack).expect("serializable admission pack")
             );
         }
         Command::Witness {
