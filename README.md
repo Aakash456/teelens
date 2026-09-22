@@ -24,3 +24,9 @@ cargo run -- plan examples/pod.yaml --runtime-class kata-qemu-coco \
 ```
 
 It is advisory by design: TeeLens does not replace Kubernetes scheduling.
+
+## kubectl plugin
+
+Install the read-only plugin with `cargo install --path . --bin kubectl-teelens`.
+Then run the same commands as `kubectl teelens plan ...`. See
+[plugin documentation](docs/kubectl-plugin.md).
