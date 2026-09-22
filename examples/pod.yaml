@@ -3,6 +3,8 @@ kind: Pod
 metadata:
   name: protected-api
   namespace: production
+  annotations:
+    teelens.io/attestation-policy: production-ml-v3
 spec:
   runtimeClassName: kata-qemu-coco
   containers:

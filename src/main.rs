@@ -42,6 +42,16 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Output::Text)]
         output: Output,
     },
+    /// Compile a trust-aware placement manifest.
+    Compile {
+        pod: PathBuf,
+        #[arg(long)]
+        runtime_class: String,
+        #[arg(long)]
+        node_inventory: PathBuf,
+        #[arg(long)]
+        kata_config: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -181,6 +191,17 @@ struct PlanReport {
 struct NodeRejection {
     name: String,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlacementManifest {
+    api_version: &'static str,
+    execution_target: String,
+    eligible_nodes: Vec<String>,
+    required_accelerators: BTreeMap<String, u32>,
+    attestation_policy: Option<String>,
+    migration: &'static str,
 }
 
 fn read(path: &PathBuf) -> Result<String, AppError> {
@@ -395,7 +416,7 @@ fn main() -> Result<(), AppError> {
             kata_config,
             output,
         } => {
-            let pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
+            let pod: Pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
                 path: pod.display().to_string(),
                 details: e.to_string(),
             })?;
@@ -463,6 +484,44 @@ fn main() -> Result<(), AppError> {
                     }
                 }
             }
+        }
+        Command::Compile {
+            pod,
+            runtime_class,
+            node_inventory,
+            kata_config,
+        } => {
+            let pod: Pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let policy = pod
+                .metadata
+                .as_ref()
+                .and_then(|m| m.annotations.get("teelens.io/attestation-policy"))
+                .cloned();
+            let inventory =
+                serde_json::from_str(&read(&node_inventory)?).map_err(|e| AppError::Parse {
+                    path: node_inventory.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let config = toml::from_str(&read(&kata_config)?).map_err(|e| AppError::Parse {
+                path: kata_config.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let plan = plan(pod, &runtime_class, inventory, config);
+            let manifest = PlacementManifest {
+                api_version: "teelens.io/placement-manifest/v1",
+                execution_target: plan.execution_target,
+                eligible_nodes: plan.eligible_nodes,
+                required_accelerators: plan.required_accelerators,
+                attestation_policy: policy,
+                migration: "deny-until-validated",
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manifest).expect("serializable placement manifest")
+            );
         }
     }
     Ok(())
