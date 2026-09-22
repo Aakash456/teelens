@@ -1,0 +1,7 @@
+{
+  "api_version": "teelens.io/node-capabilities/v1",
+  "architecture": "x86_64",
+  "kvm": true,
+  "tee": ["sev-snp"],
+  "hypervisors": ["qemu"]
+}
