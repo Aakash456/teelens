@@ -71,6 +71,8 @@ struct Pod {
 struct Metadata {
     name: Option<String>,
     namespace: Option<String>,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +105,8 @@ struct NodeCapabilities {
     hypervisors: Vec<String>,
     #[serde(default)]
     accelerators: BTreeMap<String, u32>,
+    #[serde(default)]
+    wasm_runtimes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +170,7 @@ enum Severity {
 #[serde(rename_all = "camelCase")]
 struct PlanReport {
     api_version: &'static str,
+    execution_target: String,
     required_accelerators: BTreeMap<String, u32>,
     eligible_nodes: Vec<String>,
     rejected_nodes: Vec<NodeRejection>,
@@ -308,22 +313,37 @@ fn plan(
 ) -> PlanReport {
     let required_accelerators = requested_accelerators(&pod);
     let selected_hypervisor = selected_hypervisor(&config);
+    let wasm_runtime = pod
+        .metadata
+        .as_ref()
+        .and_then(|m| m.annotations.get("teelens.io/wasm-runtime"))
+        .cloned();
     let confidential = runtime_class.contains("coco");
     let mut eligible_nodes = Vec::new();
     let mut rejected_nodes = Vec::new();
     for node in inventory.nodes {
         let mut reasons = Vec::new();
-        if !node.kvm {
+        if wasm_runtime.is_none() && !node.kvm {
             reasons.push("KVM is unavailable".into());
         }
-        if !node
-            .hypervisors
-            .iter()
-            .any(|h| Some(h) == selected_hypervisor.as_ref())
+        if wasm_runtime.is_none()
+            && !node
+                .hypervisors
+                .iter()
+                .any(|h| Some(h) == selected_hypervisor.as_ref())
         {
             reasons.push("selected Kata hypervisor is unavailable".into());
         }
-        if confidential && (selected_hypervisor.as_deref() != Some("qemu") || node.tee.is_empty()) {
+        if let Some(runtime) = &wasm_runtime {
+            if !node.wasm_runtimes.contains(runtime) {
+                reasons.push(format!("WASM runtime {runtime} is unavailable"));
+            }
+            if confidential {
+                reasons.push("confidential WASM execution is not yet modeled".into());
+            }
+        } else if confidential
+            && (selected_hypervisor.as_deref() != Some("qemu") || node.tee.is_empty())
+        {
             reasons.push("no verified confidential-computing path".into());
         }
         for (resource, needed) in &required_accelerators {
@@ -351,6 +371,14 @@ fn plan(
     }
     PlanReport {
         api_version: "teelens.io/plan/v1",
+        execution_target: wasm_runtime
+            .map(|runtime| format!("wasm:{runtime}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "vmm:{}",
+                    selected_hypervisor.unwrap_or_else(|| "unknown".into())
+                )
+            }),
         required_accelerators,
         eligible_nodes,
         rejected_nodes,
