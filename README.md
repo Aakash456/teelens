@@ -12,3 +12,15 @@ cargo run -- check examples/pod.yaml \
 ```
 
 `NodeCapabilities` is deliberately an input contract in v1. The future collector must produce this shape from node-local checks; TeeLens does not probe a host implicitly.
+
+## Heterogeneous placement planning
+
+`plan` evaluates accelerator requests in the Pod against a node inventory and explains every rejection:
+
+```bash
+cargo run -- plan examples/pod.yaml --runtime-class kata-qemu-coco \
+  --node-inventory examples/node-inventory.json \
+  --kata-config examples/configuration-qemu.toml
+```
+
+It is advisory by design: TeeLens does not replace Kubernetes scheduling.

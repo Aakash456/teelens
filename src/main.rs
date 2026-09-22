@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,19 @@ enum Command {
         #[arg(long)]
         node_capabilities: PathBuf,
         /// Kata runtime configuration TOML.
+        #[arg(long)]
+        kata_config: PathBuf,
+        #[arg(long, value_enum, default_value_t = Output::Text)]
+        output: Output,
+    },
+    /// Plan placement across a heterogeneous node inventory.
+    Plan {
+        pod: PathBuf,
+        #[arg(long)]
+        runtime_class: String,
+        /// A TeeLens NodeInventory JSON document.
+        #[arg(long)]
+        node_inventory: PathBuf,
         #[arg(long)]
         kata_config: PathBuf,
         #[arg(long, value_enum, default_value_t = Output::Text)]
@@ -64,16 +77,38 @@ struct Metadata {
 struct PodSpec {
     #[serde(rename = "runtimeClassName")]
     runtime_class_name: Option<String>,
+    #[serde(default)]
+    containers: Vec<Container>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Container {
+    resources: Option<Resources>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Resources {
+    requests: Option<BTreeMap<String, String>>,
 }
 
 /// Versioned inventory produced by a node agent or supplied by CI.
 #[derive(Debug, Deserialize)]
 struct NodeCapabilities {
+    #[serde(default)]
+    name: String,
     api_version: String,
     architecture: String,
     kvm: bool,
     tee: Vec<Tee>,
     hypervisors: Vec<String>,
+    #[serde(default)]
+    accelerators: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeInventory {
+    api_version: String,
+    nodes: Vec<NodeCapabilities>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -125,6 +160,22 @@ enum Severity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanReport {
+    api_version: &'static str,
+    required_accelerators: BTreeMap<String, u32>,
+    eligible_nodes: Vec<String>,
+    rejected_nodes: Vec<NodeRejection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeRejection {
+    name: String,
+    reasons: Vec<String>,
 }
 
 fn read(path: &PathBuf) -> Result<String, AppError> {
@@ -229,6 +280,83 @@ fn check(pod: Pod, runtime_class: String, node: NodeCapabilities, config: toml::
     }
 }
 
+fn requested_accelerators(pod: &Pod) -> BTreeMap<String, u32> {
+    let mut requested = BTreeMap::new();
+    for container in pod.spec.as_ref().into_iter().flat_map(|s| &s.containers) {
+        for (resource, quantity) in container
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .into_iter()
+            .flatten()
+        {
+            if resource.contains("gpu") || resource.contains("accelerator") {
+                if let Ok(quantity) = quantity.parse::<u32>() {
+                    *requested.entry(resource.clone()).or_default() += quantity;
+                }
+            }
+        }
+    }
+    requested
+}
+
+fn plan(
+    pod: Pod,
+    runtime_class: &str,
+    inventory: NodeInventory,
+    config: toml::Value,
+) -> PlanReport {
+    let required_accelerators = requested_accelerators(&pod);
+    let selected_hypervisor = selected_hypervisor(&config);
+    let confidential = runtime_class.contains("coco");
+    let mut eligible_nodes = Vec::new();
+    let mut rejected_nodes = Vec::new();
+    for node in inventory.nodes {
+        let mut reasons = Vec::new();
+        if !node.kvm {
+            reasons.push("KVM is unavailable".into());
+        }
+        if !node
+            .hypervisors
+            .iter()
+            .any(|h| Some(h) == selected_hypervisor.as_ref())
+        {
+            reasons.push("selected Kata hypervisor is unavailable".into());
+        }
+        if confidential && (selected_hypervisor.as_deref() != Some("qemu") || node.tee.is_empty()) {
+            reasons.push("no verified confidential-computing path".into());
+        }
+        for (resource, needed) in &required_accelerators {
+            if node.accelerators.get(resource).copied().unwrap_or_default() < *needed {
+                reasons.push(format!(
+                    "requires {needed} {resource}, node has {}",
+                    node.accelerators.get(resource).copied().unwrap_or_default()
+                ));
+            }
+        }
+        if reasons.is_empty() {
+            eligible_nodes.push(node.name);
+        } else {
+            rejected_nodes.push(NodeRejection {
+                name: node.name,
+                reasons,
+            });
+        }
+    }
+    if inventory.api_version != "teelens.io/node-inventory/v1" {
+        rejected_nodes.push(NodeRejection {
+            name: "inventory".into(),
+            reasons: vec!["unknown inventory API version".into()],
+        });
+    }
+    PlanReport {
+        api_version: "teelens.io/plan/v1",
+        required_accelerators,
+        eligible_nodes,
+        rejected_nodes,
+    }
+}
+
 fn main() -> Result<(), AppError> {
     let cli = Cli::parse();
     match cli.command {
@@ -270,6 +398,40 @@ fn main() -> Result<(), AppError> {
                             "{:?} [{}] {}",
                             finding.severity, finding.code, finding.message
                         );
+                    }
+                }
+            }
+        }
+        Command::Plan {
+            pod,
+            runtime_class,
+            node_inventory,
+            kata_config,
+            output,
+        } => {
+            let pod = serde_yaml::from_str(&read(&pod)?).map_err(|e| AppError::Parse {
+                path: pod.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let inventory =
+                serde_json::from_str(&read(&node_inventory)?).map_err(|e| AppError::Parse {
+                    path: node_inventory.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let config = toml::from_str(&read(&kata_config)?).map_err(|e| AppError::Parse {
+                path: kata_config.display().to_string(),
+                details: e.to_string(),
+            })?;
+            let report = plan(pod, &runtime_class, inventory, config);
+            match output {
+                Output::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("serializable plan")
+                ),
+                Output::Text => {
+                    println!("eligible nodes: {}", report.eligible_nodes.join(", "));
+                    for node in report.rejected_nodes {
+                        println!("{}: {}", node.name, node.reasons.join("; "));
                     }
                 }
             }

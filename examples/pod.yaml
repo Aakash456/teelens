@@ -8,3 +8,6 @@ spec:
   containers:
   - name: app
     image: example.invalid/protected-api:latest
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
