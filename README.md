@@ -63,6 +63,13 @@ installed QEMU, Cloud Hypervisor, Wasmtime, and WasmEdge versions):
 cargo run -- collect --name node-a > node-capabilities.json
 ```
 
+To inventory a runtime outside `PATH`, provide a portable explicit override:
+
+```bash
+cargo run -- collect --name node-a \
+  --runtime-path qemu=/opt/vmm/qemu-system-x86_64
+```
+
 The collector deliberately does not collect attestation evidence, private
 keys, or measurements. It reports SEV-SNP only when the host exposes
 `/dev/sev`; an AMD CCP driver alone is not treated as evidence. Hardware

@@ -89,6 +89,9 @@ enum Command {
     Collect {
         #[arg(long)]
         name: Option<String>,
+        /// Explicit runtime executable, for example qemu=/opt/vmm/qemu-system-x86_64.
+        #[arg(long = "runtime-path", value_name = "NAME=PATH")]
+        runtime_paths: Vec<String>,
     },
     /// Validate a node against a TeeLens trust policy document.
     PolicyCheck {
@@ -372,7 +375,30 @@ fn selected_hypervisor(config: &toml::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn collect_local(name: Option<String>) -> NodeCapabilities {
+fn parse_runtime_paths(entries: &[String]) -> Result<BTreeMap<String, String>, AppError> {
+    let mut paths = BTreeMap::new();
+    for entry in entries {
+        let (name, path) = entry.split_once('=').ok_or_else(|| {
+            AppError::Invalid(format!("--runtime-path must use NAME=PATH, got {entry:?}"))
+        })?;
+        if name.is_empty() || path.is_empty() || !std::path::Path::new(path).is_file() {
+            return Err(AppError::Invalid(format!(
+                "--runtime-path must name an existing file, got {entry:?}"
+            )));
+        }
+        if paths.insert(name.to_owned(), path.to_owned()).is_some() {
+            return Err(AppError::Invalid(format!(
+                "duplicate runtime path for {name:?}"
+            )));
+        }
+    }
+    Ok(paths)
+}
+
+fn collect_local(
+    name: Option<String>,
+    runtime_paths: BTreeMap<String, String>,
+) -> NodeCapabilities {
     let has_path = |path: &str| std::path::Path::new(path).exists();
     let mut tee = Vec::new();
     // CCP is a prerequisite driver on many AMD systems, but its presence does
@@ -449,8 +475,6 @@ fn collect_local(name: Option<String>) -> NodeCapabilities {
     let mut software_versions = BTreeMap::new();
     for (binary, label) in [
         ("qemu-system-x86_64", "qemu"),
-        // Oracle Linux packages the system emulator as qemu-kvm.
-        ("qemu-kvm", "qemu"),
         ("cloud-hypervisor", "cloud-hypervisor"),
         ("wasmtime", "wasmtime"),
         ("wasmedge", "wasmedge"),
@@ -460,6 +484,11 @@ fn collect_local(name: Option<String>) -> NodeCapabilities {
         }
         if let Some(version) = command_version(binary) {
             software_versions.insert(label.into(), version);
+        }
+    }
+    for (name, path) in runtime_paths {
+        if let Some(version) = command_version(&path) {
+            software_versions.insert(name, version);
         }
     }
     let hypervisors = ["qemu", "cloud-hypervisor"]
@@ -1171,11 +1200,17 @@ pub fn run() -> Result<(), AppError> {
                 serde_yaml::to_string(&patched_pod).expect("serializable patched Pod")
             );
         }
-        Command::Collect { name } => {
+        Command::Collect {
+            name,
+            runtime_paths,
+        } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&collect_local(name))
-                    .expect("serializable node capabilities")
+                serde_json::to_string_pretty(&collect_local(
+                    name,
+                    parse_runtime_paths(&runtime_paths)?
+                ))
+                .expect("serializable node capabilities")
             );
         }
         Command::PolicyCheck {
