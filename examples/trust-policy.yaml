@@ -1,0 +1,7 @@
+apiVersion: teelens.io/trust-policy/v1
+allowedTee:
+  - sev-snp
+  - tdx
+requiresKvm: true
+allowedHypervisors:
+  - qemu

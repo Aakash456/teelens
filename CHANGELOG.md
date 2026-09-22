@@ -9,3 +9,5 @@
   `ResourceClaimTemplate` objects with explicit DeviceClass mappings.
 - Added deployable DRA bundles that pair a claim template with a deliberately
   patched Pod manifest.
+- Added a non-secret local node capability collector, trust-policy validation,
+  and conservative migration preflight reports.

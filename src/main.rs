@@ -85,6 +85,29 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Collect non-secret, local node capabilities into a versioned document.
+    Collect {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Validate a node against a TeeLens trust policy document.
+    PolicyCheck {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        node_capabilities: PathBuf,
+    },
+    /// Evaluate whether a conservative live migration path is compatible.
+    MigrateCheck {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+        #[arg(long)]
+        runtime_class: String,
+        #[arg(long)]
+        kata_config: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -140,7 +163,7 @@ struct Resources {
 }
 
 /// Versioned inventory produced by a node agent or supplied by CI.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct NodeCapabilities {
     #[serde(default)]
     name: String,
@@ -153,6 +176,8 @@ struct NodeCapabilities {
     accelerators: BTreeMap<String, u32>,
     #[serde(default)]
     wasm_runtimes: Vec<String>,
+    #[serde(default)]
+    numa_nodes: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,11 +186,40 @@ struct NodeInventory {
     nodes: Vec<NodeCapabilities>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
 #[serde(rename_all = "kebab-case")]
 enum Tee {
     SevSnp,
     Tdx,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustPolicy {
+    api_version: String,
+    #[serde(default)]
+    allowed_tee: Vec<Tee>,
+    #[serde(default)]
+    requires_kvm: bool,
+    #[serde(default)]
+    allowed_hypervisors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyReport {
+    api_version: &'static str,
+    allowed: bool,
+    violations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationReport {
+    api_version: &'static str,
+    compatible: bool,
+    blockers: Vec<String>,
+    assumptions: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +354,113 @@ fn selected_hypervisor(config: &toml::Value) -> Option<String> {
         .into_iter()
         .find(|name| hypervisor.contains_key(*name))
         .map(str::to_owned)
+}
+
+fn collect_local(name: Option<String>) -> NodeCapabilities {
+    let has_path = |path: &str| std::path::Path::new(path).exists();
+    let mut tee = Vec::new();
+    if has_path("/dev/sev") || has_path("/sys/module/ccp") {
+        tee.push(Tee::SevSnp);
+    }
+    if has_path("/sys/firmware/tdx_guest") || has_path("/dev/tdx-guest") {
+        tee.push(Tee::Tdx);
+    }
+    let numa_nodes = fs::read_dir("/sys/devices/system/node")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("node"))
+                .and_then(|number| number.parse().ok())
+        })
+        .collect();
+    NodeCapabilities {
+        name: name
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "localhost".into()),
+        api_version: "teelens.io/node-capabilities/v1".into(),
+        architecture: std::env::consts::ARCH.into(),
+        kvm: has_path("/dev/kvm"),
+        tee,
+        hypervisors: Vec::new(),
+        accelerators: BTreeMap::new(),
+        wasm_runtimes: Vec::new(),
+        numa_nodes,
+    }
+}
+
+fn policy_check(policy: TrustPolicy, node: NodeCapabilities) -> PolicyReport {
+    let mut violations = Vec::new();
+    if policy.api_version != "teelens.io/trust-policy/v1" {
+        violations.push("unsupported trust policy API version".into());
+    }
+    if policy.requires_kvm && !node.kvm {
+        violations.push("policy requires KVM".into());
+    }
+    if !policy.allowed_tee.is_empty()
+        && !node.tee.iter().any(|tee| policy.allowed_tee.contains(tee))
+    {
+        violations.push("node has no policy-approved TEE".into());
+    }
+    if !policy.allowed_hypervisors.is_empty()
+        && !node
+            .hypervisors
+            .iter()
+            .any(|h| policy.allowed_hypervisors.contains(h))
+    {
+        violations.push("node has no policy-approved hypervisor".into());
+    }
+    PolicyReport {
+        api_version: "teelens.io/policy-report/v1",
+        allowed: violations.is_empty(),
+        violations,
+    }
+}
+
+fn migration_check(
+    source: NodeCapabilities,
+    destination: NodeCapabilities,
+    runtime_class: &str,
+    config: toml::Value,
+) -> MigrationReport {
+    let mut blockers = Vec::new();
+    let hypervisor = selected_hypervisor(&config);
+    if source.architecture != destination.architecture {
+        blockers.push("source and destination architectures differ".into());
+    }
+    if !source.kvm || !destination.kvm {
+        blockers.push("both nodes must have KVM".into());
+    }
+    if source.tee != destination.tee {
+        blockers.push("TEE capabilities differ".into());
+    }
+    if !source
+        .hypervisors
+        .iter()
+        .any(|h| Some(h) == hypervisor.as_ref())
+        || !destination
+            .hypervisors
+            .iter()
+            .any(|h| Some(h) == hypervisor.as_ref())
+    {
+        blockers.push("selected hypervisor is unavailable on source or destination".into());
+    }
+    if runtime_class.contains("coco") && (source.tee.is_empty() || destination.tee.is_empty()) {
+        blockers.push("confidential runtime requires a TEE on both nodes".into());
+    }
+    MigrationReport {
+        api_version: "teelens.io/migration-report/v1",
+        compatible: blockers.is_empty(),
+        blockers,
+        assumptions: vec![
+            "guest memory, device state, CPU feature flags, and attestation continuity are not measured",
+            "a compatible result is a preflight signal, not authorization to migrate",
+        ],
+    }
 }
 
 fn check(pod: Pod, runtime_class: String, node: NodeCapabilities, config: toml::Value) -> Report {
@@ -895,6 +1056,64 @@ fn main() -> Result<(), AppError> {
                 serde_yaml::to_string(&patched_pod).expect("serializable patched Pod")
             );
         }
+        Command::Collect { name } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&collect_local(name))
+                    .expect("serializable node capabilities")
+            );
+        }
+        Command::PolicyCheck {
+            policy,
+            node_capabilities,
+        } => {
+            let policy: TrustPolicy =
+                serde_yaml::from_str(&read(&policy)?).map_err(|e| AppError::Parse {
+                    path: policy.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let node: NodeCapabilities =
+                serde_json::from_str(&read(&node_capabilities)?).map_err(|e| AppError::Parse {
+                    path: node_capabilities.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&policy_check(policy, node))
+                    .expect("serializable policy report")
+            );
+        }
+        Command::MigrateCheck {
+            source,
+            destination,
+            runtime_class,
+            kata_config,
+        } => {
+            let source: NodeCapabilities =
+                serde_json::from_str(&read(&source)?).map_err(|e| AppError::Parse {
+                    path: source.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let destination: NodeCapabilities = serde_json::from_str(&read(&destination)?)
+                .map_err(|e| AppError::Parse {
+                    path: destination.display().to_string(),
+                    details: e.to_string(),
+                })?;
+            let config = toml::from_str(&read(&kata_config)?).map_err(|e| AppError::Parse {
+                path: kata_config.display().to_string(),
+                details: e.to_string(),
+            })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&migration_check(
+                    source,
+                    destination,
+                    &runtime_class,
+                    config
+                ))
+                .expect("serializable migration report")
+            );
+        }
     }
     Ok(())
 }
@@ -917,6 +1136,7 @@ mod tests {
             hypervisors: vec!["qemu".into()],
             accelerators: BTreeMap::from([("nvidia.com/gpu".into(), gpus)]),
             wasm_runtimes: vec!["wasmtime".into()],
+            numa_nodes: vec![0],
         }
     }
 
@@ -1004,5 +1224,35 @@ mod tests {
         assert!(text.contains("claims:"));
         assert!(text.contains("cpu: '1'"));
         assert!(!text.contains("nvidia.com/gpu"));
+    }
+
+    #[test]
+    fn policy_rejects_plain_node_when_tee_is_required() {
+        let policy = TrustPolicy {
+            api_version: "teelens.io/trust-policy/v1".into(),
+            allowed_tee: vec![Tee::SevSnp],
+            requires_kvm: true,
+            allowed_hypervisors: vec!["qemu".into()],
+        };
+        let report = policy_check(policy, node("plain", vec![], 0));
+        assert!(!report.allowed);
+        assert!(report.violations[0].contains("policy-approved TEE"));
+    }
+
+    #[test]
+    fn migration_rejects_different_tee_capabilities() {
+        let report = migration_check(
+            node("snp", vec![Tee::SevSnp], 0),
+            node("tdx", vec![Tee::Tdx], 0),
+            "kata-qemu-coco",
+            config(),
+        );
+        assert!(!report.compatible);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("TEE capabilities"))
+        );
     }
 }

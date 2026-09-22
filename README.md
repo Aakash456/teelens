@@ -53,6 +53,30 @@ Every container requesting an accelerator must be listed explicitly. The
 patched Pod removes the converted extended-resource request and grants only
 those named containers access to the generated claim.
 
+## v0.2 trust inputs
+
+Collect a non-secret local capability document (KVM, detected TEE indicators,
+architecture, and NUMA nodes):
+
+```bash
+cargo run -- collect --name node-a > node-capabilities.json
+```
+
+The collector deliberately does not collect attestation evidence, private
+keys, measurements, GPU inventory, or infer installed VMM/WASM runtimes. Add
+those through a reviewed node agent or CI inventory source.
+
+Validate a versioned trust policy and make a conservative migration preflight:
+
+```bash
+cargo run -- policy-check --policy examples/trust-policy.yaml \
+  --node-capabilities examples/node-capabilities.json
+
+cargo run -- migrate-check --source examples/node-capabilities.json \
+  --destination examples/node-capabilities.json \
+  --runtime-class kata-qemu-coco --kata-config examples/configuration-qemu.toml
+```
+
 ## kubectl plugin
 
 Install the read-only plugin with `cargo install --path . --bin kubectl-teelens`.

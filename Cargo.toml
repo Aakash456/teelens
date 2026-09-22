@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Preflight checks for confidential Kubernetes workloads"
+default-run = "teelens"
 
 [[bin]]
 name = "teelens"
